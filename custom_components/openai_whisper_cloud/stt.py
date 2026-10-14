@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterable
 import io
+import json
+import logging
+import re
+import time
+from collections.abc import AsyncIterable
 import wave
 
-import requests
+import aiohttp
 
 from homeassistant.components.stt import (
     AudioBitRates,
@@ -21,37 +25,91 @@ from homeassistant.components.stt import (
     SpeechToTextEntity,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import (
-    CONF_API_KEY,
-    CONF_MODEL,
-    CONF_NAME,
-    CONF_SOURCE,
-    CONF_URL,
-)
+from homeassistant.const import CONF_API_KEY, CONF_MODEL, CONF_NAME
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from . import _LOGGER
 from .const import (
-    CONF_CUSTOM_PROVIDER,
+    CONF_BASE_URL,
+    CONF_FILE_FIELD,
     CONF_PROMPT,
+    CONF_PROVIDER_TYPE,
     CONF_TEMPERATURE,
-    SUPPORTED_LANGUAGES,
+    DEFAULT_PROMPT,
+    DEFAULT_TEMPERATURE,
+    DOMAIN,
+    MAX_AUDIO_SIZE_BYTES,
+    TRANSCRIPTION_TIMEOUT,
 )
-from .whisper_provider import WhisperModel, whisper_providers
+from .whisper_provider import WhisperModel, WhisperProvider, custom_provider, get_provider
 
-# Mapping of regional language variants to base language codes for Whisper API.
-# Whisper only supports base language codes (e.g., "zh"), not regional variants
-# (e.g., "zh-tw"). These regional variants are needed for Home Assistant's
-# intent recognition system to properly load language-specific intents.
-# See: https://github.com/home-assistant/intents/issues/1104
-LANGUAGE_TO_WHISPER: dict[str, str] = {
-    "zh-cn": "zh",
-    "zh-tw": "zh",
-    "zh-hk": "zh",
-    "zh-hans": "zh",
-    "zh-hant": "zh",
-}
+_LOGGER = logging.getLogger(__name__)
+
+# Default Infomaniak model id for the two-phase (batch) flow.
+# The real id is normally extracted from the transcription URL (see
+# _infomaniak_results_base); this is the fallback used when the URL does not
+# expose it (matching the value hardcoded in the previous revision).
+INFOMANIAK_FALLBACK_MODEL_ID = "107184"
+
+
+def missing_multipart_field(body: str) -> str | None:
+    """Extract the expected multipart field name from a FastAPI 422 error body.
+
+    Servers like whisper-asr-webservice answer with e.g.
+    ``{"detail":[{"loc":["body","audio_file"],"type":"value_error.missing"}]}``
+    when the audio is uploaded under the wrong multipart field name.
+    """
+    try:
+        detail = json.loads(body).get("detail")
+    except (ValueError, AttributeError):
+        return None
+    if not isinstance(detail, list):
+        return None
+    for item in detail:
+        if not isinstance(item, dict):
+            continue
+        loc = item.get("loc")
+        if not (isinstance(loc, list) and len(loc) >= 2 and loc[0] == "body"):
+            continue
+        error_type = str(item.get("type", ""))
+        message = str(item.get("msg", "")).lower()
+        if error_type.endswith("missing") or "required" in message:
+            name = loc[-1]
+            if isinstance(name, str) and name and name != "body":
+                return name
+    return None
+
+
+def resolve_language(language: str | None, supported: list[str]) -> str | None:
+    """Map a requested language onto one supported by the model.
+
+    Regional variants (e.g. ``pt-br``) are folded onto their base language
+    (``pt``) when the base language is supported. This is needed because
+    Whisper-style APIs only accept base language codes, while Home Assistant
+    may request regional variants for its intent system.
+    """
+    if not language:
+        return None
+    lang = language.lower()
+    if lang in supported:
+        return lang
+    base = lang.split("-")[0]
+    if base in supported:
+        return base
+    return lang
+
+
+def encode_wav(data: bytes, channels: int, sample_rate: int) -> bytes:
+    """Wrap raw PCM samples into a WAV container."""
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as wav_file:
+        wav_file.setnchannels(channels)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(sample_rate)
+        wav_file.writeframes(data)
+    return buffer.getvalue()
 
 
 async def async_setup_entry(
@@ -59,37 +117,63 @@ async def async_setup_entry(
     config_entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up Whisper speech platform via config entry."""
-    _LOGGER.debug(f"STT setup Entry {config_entry.entry_id}")
+    """Set up the Whisper speech-to-text platform via config entry."""
+    _LOGGER.debug("Setting up STT entity for entry %s", config_entry.entry_id)
 
-    async_add_entities([
-        OpenAIWhisperCloudEntity(
-            custom=config_entry.data.get(CONF_CUSTOM_PROVIDER, False),
-            api_url=config_entry.data[CONF_URL] if config_entry.data.get(CONF_CUSTOM_PROVIDER) else whisper_providers[config_entry.data[CONF_SOURCE]].url,
-            api_key=config_entry.data.get(CONF_API_KEY, ""),
-            model= WhisperModel(config_entry.options[CONF_MODEL], SUPPORTED_LANGUAGES) if config_entry.data.get(CONF_CUSTOM_PROVIDER) else whisper_providers[config_entry.data[CONF_SOURCE]].models[config_entry.options[CONF_MODEL]],
-            temperature=config_entry.options[CONF_TEMPERATURE],
-            prompt=config_entry.options[CONF_PROMPT],
-            name=config_entry.data[CONF_NAME],
-            unique_id=config_entry.entry_id
+    provider_type = config_entry.data[CONF_PROVIDER_TYPE]
+    if provider_type == "custom":
+        provider = custom_provider(
+            config_entry.data.get(CONF_BASE_URL, ""),
+            config_entry.options.get(CONF_MODEL, "whisper-1"),
+            file_field=config_entry.data.get(CONF_FILE_FIELD, "file"),
         )
-    ])
+    else:
+        provider = get_provider(provider_type)
+
+    async_add_entities(
+        [
+            OpenAIWhisperEntity(
+                provider=provider,
+                api_key=config_entry.data.get(CONF_API_KEY, ""),
+                temperature=float(
+                    config_entry.options.get(CONF_TEMPERATURE, DEFAULT_TEMPERATURE)
+                ),
+                prompt=config_entry.options.get(CONF_PROMPT, DEFAULT_PROMPT),
+                model_name=config_entry.options.get(CONF_MODEL),
+                name=config_entry.data[CONF_NAME],
+                unique_id=config_entry.entry_id,
+            )
+        ]
+    )
 
 
-
-class OpenAIWhisperCloudEntity(SpeechToTextEntity):
+class OpenAIWhisperEntity(SpeechToTextEntity):
     """OpenAI Whisper API provider entity."""
 
-    def __init__(self, custom: bool, api_url: str, api_key: str, model: WhisperModel, temperature, prompt, name, unique_id) -> None:
-        """Init STT service."""
-        self.custom = custom
-        self.api_url = api_url
+    def __init__(
+        self,
+        provider: WhisperProvider,
+        api_key: str,
+        temperature: float,
+        prompt: str,
+        model_name: str | None,
+        name: str,
+        unique_id: str,
+    ) -> None:
+        """Init the STT entity."""
+        self.provider = provider
         self.api_key = api_key
-        self.model = model
         self.temperature = temperature
         self.prompt = prompt
+        self.model: WhisperModel = provider.get_model(model_name)
         self._attr_name = name
         self._attr_unique_id = unique_id
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, unique_id)},
+            name=name,
+            manufacturer=provider.name,
+            model=self.model.name,
+        )
 
     @property
     def supported_languages(self) -> list[str]:
@@ -131,86 +215,314 @@ class OpenAIWhisperCloudEntity(SpeechToTextEntity):
         """Return a list of supported channels."""
         return [AudioChannels.CHANNEL_MONO, AudioChannels.CHANNEL_STEREO]
 
-    async def async_process_audio_stream(
-        self, metadata: SpeechMetadata, stream: AsyncIterable[bytes]
+    def _build_form(
+        self, wav_data: bytes, language: str | None, file_field: str
+    ) -> aiohttp.FormData:
+        """Build the multipart form for a transcription request."""
+        form = aiohttp.FormData()
+        form.add_field(
+            file_field, wav_data, filename="audio.wav", content_type="audio/wav"
+        )
+        form.add_field("model", self.model.name)
+        if language:
+            form.add_field("language", language)
+        if self.provider.supports_temperature:
+            form.add_field("temperature", str(self.temperature))
+        if self.provider.supports_prompt and self.prompt:
+            form.add_field("prompt", self.prompt)
+        if self.provider.supports_response_format:
+            form.add_field("response_format", "json")
+        return form
+
+    # ------------------------------------------------------------------ #
+    #  Infomaniak two-phase (batch) transcription flow                    #
+    # ------------------------------------------------------------------ #
+
+    def _uses_infomaniak_flow(self) -> bool:
+        """Return True when talking to an Infomaniak batch-based endpoint."""
+        url = str(getattr(self.provider, "transcription_url", "")).lower()
+        return "infomaniak.com" in url
+
+    def _infomaniak_results_base(self, batch_id: str) -> str:
+        """Build the Infomaniak batch results base URL for a batch id."""
+        url = str(getattr(self.provider, "transcription_url", ""))
+        match = re.search(r"api\.infomaniak\.com/1/ai/(\d+)/", url)
+        model_id = match.group(1) if match else INFOMANIAK_FALLBACK_MODEL_ID
+        return f"https://api.infomaniak.com/1/ai/{model_id}/results/{batch_id}"
+
+    def _build_infomaniak_form(
+        self, wav_data: bytes, language: str | None, file_field: str
+    ) -> aiohttp.FormData:
+        """Multipart payload for the Infomaniak submission request.
+
+        Mirrors the legacy two-phase client, which always sent model,
+        language, temperature, prompt and response_format with the audio file.
+        """
+        form = aiohttp.FormData()
+        form.add_field(
+            file_field, wav_data, filename="audio.wav", content_type="audio/wav"
+        )
+        form.add_field("model", self.model.name)
+        if language:
+            form.add_field("language", language)
+        if self.temperature is not None:
+            form.add_field("temperature", str(self.temperature))
+        if self.prompt:
+            form.add_field("prompt", self.prompt)
+        form.add_field("response_format", "json")
+        return form
+
+    async def _transcribe_infomaniak(
+        self,
+        session: aiohttp.ClientSession,
+        wav_data: bytes,
+        language: str | None,
     ) -> SpeechResult:
-        """Process an audio stream to STT service."""
+        """Transcribe using Infomaniak's two-phase batch API.
 
-        _LOGGER.debug("Processing audio stream: %s", metadata)
+        Phase 1: POST the audio and read the ``batch_id`` from the reply.
+        Phase 2: poll the batch status until it is ``success``/``error`` or
+        the global timeout is reached, then download the transcription text.
+        """
+        file_field = self.provider.multipart_file_field
+        headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+        timeout = aiohttp.ClientTimeout(total=TRANSCRIPTION_TIMEOUT)
+        poll_timeout_seconds = 30.0
+        poll_interval_seconds = 0.110
 
-        data = b""
-        async for chunk in stream:
-            data += chunk
-            if len(data) / (1024 * 1024) > 24.5:
-                _LOGGER.error("Audio stream size exceed the maximum allowed by OpenAI which is 25Mb")
-                return SpeechResult("", SpeechResultState.ERROR)
+        # --- Phase 1: submit the transcription job. ---
+        try:
+            submit_response = await session.post(
+                self.provider.transcription_url,
+                data=self._build_infomaniak_form(wav_data, language, file_field),
+                headers=headers,
+                timeout=timeout,
+            )
+        except (TimeoutError, asyncio.TimeoutError, aiohttp.ClientError) as err:
+            _LOGGER.error(
+                "Error submitting Infomaniak transcription request: %s", err
+            )
+            return SpeechResult("", SpeechResultState.ERROR)
 
-        if not data:
-            _LOGGER.error("No audio data received")
+        if submit_response.status != 200:
+            body = await submit_response.text()
+            _LOGGER.error(
+                "Infomaniak submission failed with status %d: %s",
+                submit_response.status,
+                body[:500],
+            )
             return SpeechResult("", SpeechResultState.ERROR)
 
         try:
-            temp_file = io.BytesIO()
-            with wave.open(temp_file, "wb") as wav_file:
-                wav_file.setnchannels(metadata.channel)
-                wav_file.setframerate(metadata.sample_rate)
-                wav_file.setsampwidth(2)
-                wav_file.writeframes(data)
-
-            # Ensure the buffer is at the start before passing it
-            temp_file.seek(0)
-
-            _LOGGER.debug("Temp wav audio file created of %.2f Mb", temp_file.getbuffer().nbytes / (1024 * 1024))
-
-            # Prepare the files parameter with a proper filename
-            files = {
-                "file": ("audio.wav", temp_file, "audio/wav"),
-            }
-
-            # Prepare the data payload
-            # Convert regional language variants to base language for Whisper API
-            whisper_language = LANGUAGE_TO_WHISPER.get(
-                metadata.language.lower() if metadata.language else "",
-                metadata.language,
+            submit_payload = await submit_response.json(content_type=None)
+        except ValueError:
+            body = await submit_response.text()
+            _LOGGER.error(
+                "Invalid JSON in Infomaniak submission response: %s",
+                body[:500],
             )
-            if whisper_language != metadata.language:
-                _LOGGER.debug(
-                    "Converted language '%s' to '%s' for Whisper API",
-                    metadata.language,
-                    whisper_language,
+            return SpeechResult("", SpeechResultState.ERROR)
+
+        batch_id = (
+            submit_payload.get("batch_id")
+            if isinstance(submit_payload, dict)
+            else None
+        )
+        if not batch_id:
+            _LOGGER.error(
+                "No batch_id in Infomaniak submission response: %s",
+                str(submit_payload)[:500],
+            )
+            return SpeechResult("", SpeechResultState.ERROR)
+
+        _LOGGER.debug("Infomaniak batch_id: %s", batch_id)
+
+        # --- Phase 2: poll the batch status. ---
+        base_url = self._infomaniak_results_base(batch_id)
+        start_time = time.monotonic()
+
+        while True:
+            try:
+                status_response = await session.get(
+                    base_url, headers=headers, timeout=timeout
                 )
-            data = {
-                "model": self.model.name,
-                "language": whisper_language,
-                "temperature": self.temperature,
-                "prompt": self.prompt,
-                "response_format": "json",
-            }
-
-            # Make the request in a separate thread
-            response = await asyncio.to_thread(
-                requests.post,
-                f"{self.api_url}/v1/audio/transcriptions" if not self.custom else self.api_url,
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                },
-                files=files,
-                data=data
-            )
-
-            _LOGGER.debug("Transcription request took %f s and returned %d - %s", response.elapsed.seconds, response.status_code, response.reason)
-
-            # Parse the JSON response
-            transcription = response.json().get("text", "")
-
-            _LOGGER.debug("TRANSCRIPTION: %s", transcription)
-
-            if not transcription:
-                _LOGGER.error(response.text)
+            except (TimeoutError, asyncio.TimeoutError, aiohttp.ClientError) as err:
+                _LOGGER.error(
+                    "Error polling Infomaniak batch status: %s", err
+                )
                 return SpeechResult("", SpeechResultState.ERROR)
 
-            return SpeechResult(transcription, SpeechResultState.SUCCESS)
+            if status_response.status != 200:
+                body = await status_response.text()
+                _LOGGER.error(
+                    "Infomaniak batch status check failed: %d: %s",
+                    status_response.status,
+                    body[:500],
+                )
+                return SpeechResult("", SpeechResultState.ERROR)
 
-        except requests.exceptions.RequestException as e:
-            _LOGGER.error(e)
+            try:
+                status_payload = await status_response.json(content_type=None)
+            except ValueError:
+                body = await status_response.text()
+                _LOGGER.error(
+                    "Invalid JSON in Infomaniak status response: %s",
+                    body[:500],
+                )
+                return SpeechResult("", SpeechResultState.ERROR)
+
+            status = (
+                status_payload.get("status")
+                if isinstance(status_payload, dict)
+                else None
+            )
+            _LOGGER.debug("Infomaniak batch status: %s", status)
+
+            if status == "success":
+                break
+
+            if status == "error":
+                _LOGGER.error(
+                    "Infomaniak batch returned an error: %s",
+                    str(status_payload)[:500],
+                )
+                return SpeechResult("", SpeechResultState.ERROR)
+
+            if time.monotonic() - start_time > poll_timeout_seconds:
+                _LOGGER.error(
+                    "Timeout waiting for Infomaniak transcription result"
+                )
+                return SpeechResult("", SpeechResultState.ERROR)
+
+            await asyncio.sleep(poll_interval_seconds)
+
+        # --- Phase 2 (continued): download the transcription text. ---
+        try:
+            download_response = await session.get(
+                f"{base_url}/download", headers=headers, timeout=timeout
+            )
+        except (TimeoutError, asyncio.TimeoutError, aiohttp.ClientError) as err:
+            _LOGGER.error("Error downloading Infomaniak transcription: %s", err)
             return SpeechResult("", SpeechResultState.ERROR)
+
+        if download_response.status != 200:
+            body = await download_response.text()
+            _LOGGER.error(
+                "Infomaniak download failed with status %d: %s",
+                download_response.status,
+                body[:500],
+            )
+            return SpeechResult("", SpeechResultState.ERROR)
+
+        body_text = await download_response.text()
+        try:
+            result = json.loads(body_text)
+            if isinstance(result, dict):
+                transcription = result.get("text", "")
+            else:
+                transcription = str(result).strip()
+        except ValueError:
+            # Plain-text reply, e.g. whisper-asr-webservice style.
+            transcription = body_text.strip()
+
+        if not transcription:
+            _LOGGER.error("Infomaniak returned an empty transcription")
+            return SpeechResult("", SpeechResultState.ERROR)
+
+        _LOGGER.debug("Infomaniak transcription: %s", transcription)
+        return SpeechResult(transcription, SpeechResultState.SUCCESS)
+    # ------------------------------------------------------------------ #
+
+    async def async_process_audio_stream(
+        self, metadata: SpeechMetadata, stream: AsyncIterable[bytes]
+    ) -> SpeechResult:
+        """Process an audio stream to text."""
+        _LOGGER.debug("Processing audio stream: %s", metadata)
+
+        chunks: list[bytes] = []
+        size = 0
+        async for chunk in stream:
+            chunks.append(chunk)
+            size += len(chunk)
+            if size > MAX_AUDIO_SIZE_BYTES:
+                _LOGGER.error(
+                    "Audio stream exceeds the maximum allowed size of %.1f MB",
+                    MAX_AUDIO_SIZE_BYTES / (1024 * 1024),
+                )
+                return SpeechResult("", SpeechResultState.ERROR)
+
+        if size == 0:
+            _LOGGER.error("No audio data received")
+            return SpeechResult("", SpeechResultState.ERROR)
+
+        wav_data = await self.hass.async_add_executor_job(
+            encode_wav, b"".join(chunks), int(metadata.channel), int(metadata.sample_rate)
+        )
+        _LOGGER.debug(
+            "Encoded %.2f MB of audio to WAV", len(wav_data) / (1024 * 1024)
+        )
+
+        language = resolve_language(metadata.language, self.model.languages)
+
+        headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+        session = async_get_clientsession(self.hass)
+
+        if self._uses_infomaniak_flow():
+            return await self._transcribe_infomaniak(
+                session, wav_data, language
+            )
+
+        file_field = self.provider.multipart_file_field
+        try:
+            response = await session.post(
+                self.provider.transcription_url,
+                data=self._build_form(wav_data, language, file_field),
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=TRANSCRIPTION_TIMEOUT),
+            )
+            if response.status == 422:
+                body = await response.text()
+                missing = missing_multipart_field(body)
+                if missing and missing != file_field:
+                    _LOGGER.info(
+                        "Provider expects the audio in multipart field '%s' instead of '%s', retrying",
+                        missing,
+                        file_field,
+                    )
+                    file_field = missing
+                    response = await session.post(
+                        self.provider.transcription_url,
+                        data=self._build_form(wav_data, language, file_field),
+                        headers=headers,
+                        timeout=aiohttp.ClientTimeout(total=TRANSCRIPTION_TIMEOUT),
+                    )
+
+            if response.status != 200:
+                body = await response.text()
+                _LOGGER.error(
+                    "Transcription request failed with status %d: %s",
+                    response.status,
+                    body[:500],
+                )
+                return SpeechResult("", SpeechResultState.ERROR)
+
+            body_text = await response.text()
+            try:
+                result = json.loads(body_text)
+            except ValueError:
+                # Plain text response (e.g. whisper-asr-webservice /asr)
+                result = body_text
+            if isinstance(result, dict):
+                transcription = result.get("text", "")
+            else:
+                transcription = str(result).strip()
+        except (TimeoutError, asyncio.TimeoutError, aiohttp.ClientError, ValueError) as err:
+            _LOGGER.error("Error during transcription: %s", err)
+            return SpeechResult("", SpeechResultState.ERROR)
+
+        if not transcription:
+            _LOGGER.error("Provider returned an empty transcription")
+            return SpeechResult("", SpeechResultState.ERROR)
+
+        _LOGGER.debug("Transcription: %s", transcription)
+        return SpeechResult(transcription, SpeechResultState.SUCCESS)
